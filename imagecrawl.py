@@ -13,36 +13,52 @@ import tempfile
 import pickle
 import zipfile
 import base64
-import dropbox
-from dropbox.exceptions import AuthError
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload, MediaIoBaseDownload
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # Constants
-DROPBOX_SESSION_STATE_PATH = "/familysearch_session_state.pkl"
+GDRIVE_FOLDER_NAME = "PuertoRicoArchive"
+GDRIVE_SESSION_STATE_FILENAME = "familysearch_session_state.pkl"
 
-def get_dropbox_client():
-    """Create and return an authenticated Dropbox client."""
-    # Get Dropbox access token from environment variables
-    access_token = os.getenv('DROPBOX_ACCESS_TOKEN')
+def get_google_drive_service():
+    """Create and return an authenticated Google Drive service."""
+    # Check for credentials in environment variable first (most secure)
+    creds_json = os.getenv('GOOGLE_DRIVE_CREDENTIALS')
     
-    if not access_token:
-        st.error("Dropbox access token not found in environment variables.")
-        return None
+    if creds_json:
+        # Load credentials from environment variable
+        import json
+        from io import StringIO
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/drive'])
+    else:
+        # Check for credentials file path in environment variable (second option)
+        creds_file = os.getenv('GOOGLE_DRIVE_CREDENTIALS_FILE')
+        if not creds_file:
+            st.error("Google Drive credentials not found. Set GOOGLE_DRIVE_CREDENTIALS or GOOGLE_DRIVE_CREDENTIALS_FILE environment variable.")
+            return None
+        
+        # Load credentials from file path
+        try:
+            creds = Credentials.from_service_account_file(creds_file, scopes=['https://www.googleapis.com/auth/drive'])
+        except Exception as e:
+            st.error(f"Error loading Google Drive credentials: {e}")
+            return None
     
     try:
-        dbx = dropbox.Dropbox(access_token)
-        # Test the connection
-        dbx.users_get_current_account()
-        return dbx
-    except AuthError as e:
-        st.error(f"Dropbox authentication failed: {e}")
-        return None
+        # Create Drive API client
+        service = build('drive', 'v3', credentials=creds)
+        # Test connection with a simple request
+        service.files().list(pageSize=1).execute()
+        return service
     except Exception as e:
-        st.error(f"Dropbox connection error: {e}")
+        st.error(f"Google Drive connection error: {e}")
         return None
-
+        
 # Set page config
 st.set_page_config(
     page_title="FamilySearch Image Downloader",
@@ -50,13 +66,39 @@ st.set_page_config(
     layout="wide"
 )
 
+def get_or_create_folder(service, folder_name):
+    """
+    Get the folder ID for the specified folder name, creating it if it doesn't exist.
+    """
+    # Check if folder already exists
+    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    results = service.files().list(q=query).execute()
+    items = results.get('files', [])
+    
+    if items:
+        # Folder exists, return its ID
+        print({items['id']})
+        return items[0]['id']
+    else:
+        # Create the folder
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        
+        folder = service.files().create(
+            body=file_metadata,
+            fields='id'
+        ).execute()
+        
+        return folder.get('id')
 
 # Functions for session state persistence
 def save_session_state():
-    """Save session state to Dropbox."""
-    dbx = get_dropbox_client()
-    if not dbx:
-        st.warning("Could not connect to Dropbox. Session state will not be saved.")
+    """Save session state to Google Drive in the specified folder."""
+    drive_service = get_google_drive_service()
+    if not drive_service:
+        st.warning("Could not connect to Google Drive. Session state will not be saved.")
         return False
     
     state_to_save = {
@@ -69,61 +111,97 @@ def save_session_state():
     }
     
     try:
+        # Get or create the folder
+        folder_id = get_or_create_folder(drive_service, GDRIVE_FOLDER_NAME)
+        
         # Serialize the session state to bytes
         with io.BytesIO() as stream:
             pickle.dump(state_to_save, stream)
             stream.seek(0)
             
-            # Upload to Dropbox, overwriting if the file already exists
-            dbx.files_upload(
-                stream.getvalue(), 
-                DROPBOX_SESSION_STATE_PATH,
-                mode=dropbox.files.WriteMode.overwrite
-            )
+            # Check if file already exists in the folder
+            query = f"name='{GDRIVE_SESSION_STATE_FILENAME}' and '{folder_id}' in parents and trashed=false"
+            results = drive_service.files().list(q=query).execute()
+            items = results.get('files', [])
+            
+            media = MediaIoBaseUpload(stream, mimetype='application/octet-stream')
+            
+            if items:
+                # Update existing file
+                file_id = items[0]['id']
+                drive_service.files().update(
+                    fileId=file_id,
+                    media_body=media
+                ).execute()
+            else:
+                # Create new file in the specified folder
+                file_metadata = {
+                    'name': GDRIVE_SESSION_STATE_FILENAME,
+                    'parents': [folder_id]  # This puts the file in the specified folder
+                }
+                drive_service.files().create(
+                    body=file_metadata,
+                    media_body=media
+                ).execute()
         
         return True
     except Exception as e:
-        st.warning(f"Error saving session state to Dropbox: {e}")
+        st.warning(f"Error saving session state to Google Drive: {e}")
         import traceback
         st.warning(traceback.format_exc())
         return False
-
+    
 def load_session_state():
-    """Load session state from Dropbox if it exists."""
-    dbx = get_dropbox_client()
-    if not dbx:
-        st.warning("Could not connect to Dropbox. Unable to load previous session.")
+    """Load session state from Google Drive if it exists in the specified folder."""
+    drive_service = get_google_drive_service()
+    if not drive_service:
+        st.warning("Could not connect to Google Drive. Unable to load previous session.")
         return False
     
     try:
-        # Check if the file exists
-        try:
-            metadata = dbx.files_get_metadata(DROPBOX_SESSION_STATE_PATH)
-        except dropbox.exceptions.ApiError as e:
-            if e.error.is_path() and e.error.get_path().is_not_found():
-                # File doesn't exist yet
-                return False
-            else:
-                # Some other error
-                raise
+        # Get the folder ID if it exists
+        folder_query = f"name='{GDRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        folder_results = drive_service.files().list(q=folder_query).execute()
+        folder_items = folder_results.get('files', [])
         
+        if not folder_items:
+            # Folder doesn't exist
+            return False
+            
+        folder_id = folder_items[0]['id']
+        
+        # Check if the file exists in the folder
+        query = f"name='{GDRIVE_SESSION_STATE_FILENAME}' and '{folder_id}' in parents and trashed=false"
+        results = drive_service.files().list(q=query).execute()
+        items = results.get('files', [])
+        
+        if not items:
+            # File doesn't exist in the folder
+            return False
+            
         # Download the file
-        _, response = dbx.files_download(DROPBOX_SESSION_STATE_PATH)
+        file_id = items[0]['id']
+        request = drive_service.files().get_media(fileId=file_id)
         
-        # Load the state from the response
-        with io.BytesIO(response.content) as stream:
+        with io.BytesIO() as stream:
+            downloader = MediaIoBaseDownload(stream, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            
+            stream.seek(0)
             saved_state = pickle.load(stream)
             
             # Restore saved state to session_state
             for key, value in saved_state.items():
                 st.session_state[key] = value
                 
-            st.success("Loaded previous session from Dropbox")
+            st.success(f"Loaded previous session from Google Drive folder: {GDRIVE_FOLDER_NAME}")
             return True
             
     except Exception as e:
-        st.warning(f"Error loading session state from Dropbox: {e}")
-        return False
+        st.warning(f"Error loading session state from Google Drive: {e}")
+        return False    
 
 # Initialize session state variables if they don't exist
 if 'initialized' not in st.session_state:
@@ -150,25 +228,94 @@ if 'initialized' not in st.session_state:
         st.session_state.delay_between_downloads = 0.5
         st.session_state.initialized = True
 
-def cleanup_dropbox_state():
-    """Delete session state file from Dropbox when requested."""
-    dbx = get_dropbox_client()
-    if not dbx:
-        st.warning("Could not connect to Dropbox for cleanup.")
+def load_session_state():
+    """Load session state from Google Drive if it exists in the specified folder."""
+    drive_service = get_google_drive_service()
+    if not drive_service:
+        st.warning("Could not connect to Google Drive. Unable to load previous session.")
         return False
     
     try:
-        dbx.files_delete_v2(DROPBOX_SESSION_STATE_PATH)
-        return True
-    except dropbox.exceptions.ApiError as e:
-        if e.error.is_path() and e.error.get_path().is_not_found():
+        # Get the folder ID if it exists
+        folder_query = f"name='{GDRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        folder_results = drive_service.files().list(q=folder_query).execute()
+        folder_items = folder_results.get('files', [])
+        
+        if not folder_items:
+            # Folder doesn't exist
+            return False
+            
+        folder_id = folder_items[0]['id']
+        
+        # Check if the file exists in the folder
+        query = f"name='{GDRIVE_SESSION_STATE_FILENAME}' and '{folder_id}' in parents and trashed=false"
+        results = drive_service.files().list(q=query).execute()
+        items = results.get('files', [])
+        
+        if not items:
+            # File doesn't exist in the folder
+            return False
+            
+        # Download the file
+        file_id = items[0]['id']
+        request = drive_service.files().get_media(fileId=file_id)
+        
+        with io.BytesIO() as stream:
+            downloader = MediaIoBaseDownload(stream, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            
+            stream.seek(0)
+            saved_state = pickle.load(stream)
+            
+            # Restore saved state to session_state
+            for key, value in saved_state.items():
+                st.session_state[key] = value
+                
+            st.success(f"Loaded previous session from Google Drive folder: {GDRIVE_FOLDER_NAME}")
+            return True
+            
+    except Exception as e:
+        st.warning(f"Error loading session state from Google Drive: {e}")
+        return False
+
+def cleanup_google_drive_state():
+    """Delete session state file from Google Drive when requested."""
+    drive_service = get_google_drive_service()
+    if not drive_service:
+        st.warning("Could not connect to Google Drive for cleanup.")
+        return False
+    
+    try:
+        # Find the folder
+        folder_query = f"name='{GDRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        folder_results = drive_service.files().list(q=folder_query).execute()
+        folder_items = folder_results.get('files', [])
+        
+        if not folder_items:
+            # Folder doesn't exist
+            return True
+            
+        folder_id = folder_items[0]['id']
+        
+        # Find the file in the folder
+        query = f"name='{GDRIVE_SESSION_STATE_FILENAME}' and '{folder_id}' in parents and trashed=false"
+        results = drive_service.files().list(q=query).execute()
+        items = results.get('files', [])
+        
+        if not items:
             # File doesn't exist
             return True
-        else:
-            st.warning(f"Error cleaning up Dropbox session state: {e}")
-            return False
+            
+        # Delete the file
+        file_id = items[0]['id']
+        drive_service.files().delete(fileId=file_id).execute()
+        return True
+    except Exception as e:
+        st.warning(f"Error cleaning up Google Drive session state: {e}")
+        return False
 
-# Functions from original script
 def extract_ids_from_urls(content):
     """Extract IDs from FamilySearch URLs in content."""
     st.write("Extracting IDs from URLs...")
@@ -882,6 +1029,7 @@ def on_exit():
     if "temp_dir" in st.session_state and os.path.exists(st.session_state.temp_dir):
         try:
             shutil.rmtree(st.session_state.temp_dir)
+            cleanup_google_drive_state
         except:
             pass
 
