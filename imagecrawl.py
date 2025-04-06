@@ -77,7 +77,6 @@ def get_or_create_folder(service, folder_name):
     
     if items:
         # Folder exists, return its ID
-        print({items['id']})
         return items[0]['id']
     else:
         # Create the folder
