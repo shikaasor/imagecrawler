@@ -22,7 +22,7 @@ load_dotenv()
 
 # Constants
 GDRIVE_FOLDER_NAME = "PuertoRicoArchive"
-GDRIVE_SESSION_STATE_FILENAME = "familysearch_session_state.pkl"
+GDRIVE_SESSION_STATE_FILENAME = "/familysearch_session_state.pkl"
 
 def get_google_drive_service():
     """Create and return an authenticated Google Drive service."""
