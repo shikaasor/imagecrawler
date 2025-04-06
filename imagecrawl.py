@@ -13,6 +13,35 @@ import tempfile
 import pickle
 import zipfile
 import base64
+import dropbox
+from dropbox.exceptions import AuthError
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Constants
+DROPBOX_SESSION_STATE_PATH = "/familysearch_session_state.pkl"
+
+def get_dropbox_client():
+    """Create and return an authenticated Dropbox client."""
+    # Get Dropbox access token from environment variables
+    access_token = os.getenv('DROPBOX_ACCESS_TOKEN')
+    
+    if not access_token:
+        st.error("Dropbox access token not found in environment variables.")
+        return None
+    
+    try:
+        dbx = dropbox.Dropbox(access_token)
+        # Test the connection
+        dbx.users_get_current_account()
+        return dbx
+    except AuthError as e:
+        st.error(f"Dropbox authentication failed: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Dropbox connection error: {e}")
+        return None
 
 # Set page config
 st.set_page_config(
@@ -21,12 +50,15 @@ st.set_page_config(
     layout="wide"
 )
 
-# Constants
-SESSION_STATE_FILE = "familysearch_session_state.pkl"
 
 # Functions for session state persistence
 def save_session_state():
-    """Save session state to a file."""
+    """Save session state to Dropbox."""
+    dbx = get_dropbox_client()
+    if not dbx:
+        st.warning("Could not connect to Dropbox. Session state will not be saved.")
+        return False
+    
     state_to_save = {
         'extracted_ids': st.session_state.extracted_ids,
         'download_progress': st.session_state.download_progress,
@@ -36,27 +68,62 @@ def save_session_state():
         'delay_between_downloads': st.session_state.delay_between_downloads
     }
     
-    with open(SESSION_STATE_FILE, 'wb') as f:
-        pickle.dump(state_to_save, f)
-    # st.write(f"Session state saved to {SESSION_STATE_FILE}")
+    try:
+        # Serialize the session state to bytes
+        with io.BytesIO() as stream:
+            pickle.dump(state_to_save, stream)
+            stream.seek(0)
+            
+            # Upload to Dropbox, overwriting if the file already exists
+            dbx.files_upload(
+                stream.getvalue(), 
+                DROPBOX_SESSION_STATE_PATH,
+                mode=dropbox.files.WriteMode.overwrite
+            )
+        
+        return True
+    except Exception as e:
+        st.warning(f"Error saving session state to Dropbox: {e}")
+        import traceback
+        st.warning(traceback.format_exc())
+        return False
 
 def load_session_state():
-    """Load session state from a file if it exists."""
-    if os.path.exists(SESSION_STATE_FILE):
+    """Load session state from Dropbox if it exists."""
+    dbx = get_dropbox_client()
+    if not dbx:
+        st.warning("Could not connect to Dropbox. Unable to load previous session.")
+        return False
+    
+    try:
+        # Check if the file exists
         try:
-            with open(SESSION_STATE_FILE, 'rb') as f:
-                saved_state = pickle.load(f)
-                
+            metadata = dbx.files_get_metadata(DROPBOX_SESSION_STATE_PATH)
+        except dropbox.exceptions.ApiError as e:
+            if e.error.is_path() and e.error.get_path().is_not_found():
+                # File doesn't exist yet
+                return False
+            else:
+                # Some other error
+                raise
+        
+        # Download the file
+        _, response = dbx.files_download(DROPBOX_SESSION_STATE_PATH)
+        
+        # Load the state from the response
+        with io.BytesIO(response.content) as stream:
+            saved_state = pickle.load(stream)
+            
             # Restore saved state to session_state
             for key, value in saved_state.items():
                 st.session_state[key] = value
                 
-            st.write(f"Loaded previous session from {SESSION_STATE_FILE}")
+            st.success("Loaded previous session from Dropbox")
             return True
-        except Exception as e:
-            st.warning(f"Error loading session state: {e}")
-    
-    return False
+            
+    except Exception as e:
+        st.warning(f"Error loading session state from Dropbox: {e}")
+        return False
 
 # Initialize session state variables if they don't exist
 if 'initialized' not in st.session_state:
@@ -82,6 +149,24 @@ if 'initialized' not in st.session_state:
         st.session_state.authorization = ""
         st.session_state.delay_between_downloads = 0.5
         st.session_state.initialized = True
+
+def cleanup_dropbox_state():
+    """Delete session state file from Dropbox when requested."""
+    dbx = get_dropbox_client()
+    if not dbx:
+        st.warning("Could not connect to Dropbox for cleanup.")
+        return False
+    
+    try:
+        dbx.files_delete_v2(DROPBOX_SESSION_STATE_PATH)
+        return True
+    except dropbox.exceptions.ApiError as e:
+        if e.error.is_path() and e.error.get_path().is_not_found():
+            # File doesn't exist
+            return True
+        else:
+            st.warning(f"Error cleaning up Dropbox session state: {e}")
+            return False
 
 # Functions from original script
 def extract_ids_from_urls(content):

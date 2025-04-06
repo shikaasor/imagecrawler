@@ -2,3 +2,5 @@ streamlit
 requests
 pillow
 matplotlib
+dropbox
+python-dotenv
