@@ -224,7 +224,7 @@ if 'initialized' not in st.session_state:
         st.session_state.download_started = False
         st.session_state.current_step = 1  # 1: Extract IDs, 2: Configure, 3: Download
         st.session_state.authorization = ""
-        st.session_state.delay_between_downloads = 0.5
+        st.session_state.delay_between_downloads = 0.2
         st.session_state.initialized = True
 
 def load_session_state():
@@ -833,10 +833,10 @@ def main():
         # Download settings
         st.subheader("Download Settings")
         delay_input = st.number_input("Delay between downloads (seconds)", 
-                             min_value=0.5, 
+                             min_value=0.1, 
                              max_value=10.0, 
                              value=st.session_state.delay_between_downloads,
-                             step=0.5,
+                             step=0.1,
                              key="delay_input")
         if delay_input != st.session_state.delay_between_downloads:
             st.session_state.delay_between_downloads = delay_input
