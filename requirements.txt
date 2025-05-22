@@ -1,9 +1,9 @@
-streamlit
-requests
-pillow
-matplotlib
-google-auth
+streamlit==1.40.1
+requests==2.32.3
+pillow==11.0.0
+matplotlib==3.10.0
+google-auth==2.38.0
 google-auth-oauthlib
 google-auth-httplib2
-google-api-python-client
-python-dotenv
+google-api-python-client==2.161.0
+python-dotenv==1.0.1
